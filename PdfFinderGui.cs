@@ -87,6 +87,8 @@ namespace PdfFinder {
         private Label lblResult;
         private volatile bool s_cancel = false;   // 暂停/取消扫描标志
         private int s_hoverLine = -1;             // 当前鼠标悬停的结果行（-1=无），用于悬停高亮反馈
+        private int s_hotStart = -1;              // 已染蓝内容的起始字符下标（还色按范围还，不按行号猜）
+        private int s_hotLen = 0;                 // 已染蓝内容的长度
 
         public MainForm() {
             Text = "仓管员PDF查找器 v" + APP_VERSION;
@@ -151,26 +153,30 @@ namespace PdfFinder {
                     MessageBox.Show("打开失败：" + ex.Message, "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 }
             };
-            // 悬停反馈（潘工 2026-09-23）：鼠标移到某条【文件地址】上时该行变蓝，
-            // 提示"这里可以双击打开"。TextBox 做不到，故结果框已换成 RichTextBox。
-            // 只有真正是命中文件行（ExtractHitPath 认得出来）才点亮，状态/统计文字不点亮。
+            // 悬停反馈（潘工 2026-09-23，0016 修正"抖动"与"移开仍蓝"）：
+            // 鼠标移到某条【文件地址】上时该行变蓝，提示"这里可以双击打开"。
+            // 0015 的两处病根：
+            //   ① SetLineHot 里"把插入点挪到文末复位颜色"会让 RichTextBox 先滚到结尾再滚回来，
+            //      且着色全程不抑制重绘 → 每次移行都可见地抖一下；
+            //   ② 扫描是 AppendOut 边扫边追加的，追加触发 TextChanged 时只把 s_hoverLine 清成 -1、
+            //      不还色 → 蓝色留在内容里，MouseLeave 再想还原已无从下手 → 永远蓝着。
+            // 0016 改法：着色一律走 PaintRange（WM_SETREDRAW 冻结重绘 + 存/还滚动位），
+            // 并把染蓝的精确字符范围记在 s_hotStart/s_hotLen，还色时按范围还、不按行号猜。
             txtResult.MouseMove += (s, e) => {
                 try {
-                    int ci = txtResult.GetCharIndexFromPosition(e.Location);
-                    int li = txtResult.GetLineFromCharIndex(ci);
-                    if (li == s_hoverLine) return;              // 还在同一行：什么都不做，避免反复着色闪烁
-                    string[] lines = txtResult.Lines;
-                    bool isHit = (li >= 0 && li < lines.Length && ExtractHitPath(lines[li]) != null);
-                    SetLineHot(s_hoverLine, false);             // 先复原上一行
-                    s_hoverLine = isHit ? li : -1;              // 只有命中行才进入高亮态
-                    SetLineHot(s_hoverLine, true);              // 再点亮当前行
+                    int li = HoverLineAt(e);
+                    if (li == s_hoverLine) return;              // 还在同一行：不动，避免反复着色
+                    ClearHot();                                 // 先按记录范围复原上一行
+                    if (li < 0) return;
+                    int start = txtResult.GetFirstCharIndexFromLine(li);
+                    int len = txtResult.Lines[li].Length;
+                    if (start < 0 || len <= 0) return;
+                    PaintRange(start, len, System.Drawing.Color.Blue);
+                    s_hotStart = start; s_hotLen = len; s_hoverLine = li;
                 } catch { }
             };
-            txtResult.MouseLeave += (s, e) => {
-                try { SetLineHot(s_hoverLine, false); } catch { }
-                s_hoverLine = -1;
-            };
-            txtResult.TextChanged += (s, e) => { s_hoverLine = -1; };   // 内容变了(新一轮扫描)，悬停态作废
+            txtResult.MouseLeave += (s, e) => { try { ClearHot(); } catch { } };
+            txtResult.TextChanged += (s, e) => { try { ClearHot(); } catch { } };   // 追加/清空都要把蓝色还掉
             this.Shown += (s, e) => {
                 string ed = System.IO.Path.GetDirectoryName(Application.ExecutablePath);
                 // 启动就留一条痕（对标 MES 的 upd_log）。现场"打开软件没反应"时，
@@ -183,7 +189,7 @@ namespace PdfFinder {
         }
 
         // ================= 自动更新（对标 update.c 机制）=================
-        public const string APP_VERSION = "2026.09.23.0015";   // 本地版本（YYYY.MM.DD.SEQ），唯一版本来源
+        public const string APP_VERSION = "2026.09.23.0016";   // 本地版本（YYYY.MM.DD.SEQ），唯一版本来源
         // 更新源（顺序即优先级）。
         // 【2026-09-23 现场实测定版】原方案照抄 MES 的 5 个(raw → fastly → gcore → testingcf → cdn)，
         // 但今天定位到一个 MES 那边没暴露的问题：**jsDelivr 对 @main 分支文件的缓存最长 12 小时**。
@@ -662,37 +668,67 @@ namespace PdfFinder {
             } catch { }
         }
 
-        // ===== 悬停高亮：把结果框某一行染蓝/复原 =====
-        // 用 EM_GETSCROLLPOS/EM_SETSCROLLPOS 存取滚动位置：着色要走 Select()，
-        // 而 Select 可能把视图带走；GET 和 SET 用的是同一套坐标单位，原样存取即可还原，
-        // 不需要知道它是像素还是 twips。悬停只是"给个反馈"，绝不能把视图/选区弄乱。
+        // ===== 悬停高亮（0016 重写）：着色/还原统一走 PaintRange =====
+        // EM_GETSCROLLPOS/EM_SETSCROLLPOS 存取滚动位置：着色要走 Select()，
+        // 而 Select 可能把视图带走；GET 和 SET 用同一套坐标单位，原样存取即可还原。
         [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Auto)]
         private static extern int SendMessage(IntPtr hWnd, int msg, int wParam, ref POINT lParam);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        private static extern void SendMessage(IntPtr hWnd, int msg, int wParam, System.IntPtr lParam);
         [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
         private struct POINT { public int X; public int Y; }
         private const int EM_GETSCROLLPOS = 0x04DD;
         private const int EM_SETSCROLLPOS = 0x04DE;
+        private const int WM_SETREDRAW = 0x000B;
 
-        // 把结果框第 line 行染蓝(hot=true)/还原(hot=false)。line<0 时什么都不做。
-        private void SetLineHot(int line, bool hot) {
-            if (line < 0) return;
-            string[] lines = txtResult.Lines;
-            if (line >= lines.Length) return;
-            int start = txtResult.GetFirstCharIndexFromLine(line);
-            if (start < 0) return;
-            int len = lines[line].Length;
-            if (len <= 0) return;
+        // 对 [start, start+len) 上色。全程 WM_SETREDRAW 冻结重绘：中间的 Select/换色/滚动
+        // 一概不可见，最后一次性 Invalidate —— 这是 0015 "悬停乱抖"的根治点。
+        private void PaintRange(int start, int len, System.Drawing.Color c) {
+            if (start < 0 || len <= 0) return;
             var sp = new POINT();
             try { SendMessage(txtResult.Handle, EM_GETSCROLLPOS, 0, ref sp); } catch { }
             int selStart = txtResult.SelectionStart, selLen = txtResult.SelectionLength;
-            txtResult.Select(start, len);
-            txtResult.SelectionColor = hot ? System.Drawing.Color.Blue : txtResult.ForeColor;
-            txtResult.Select(selStart, selLen);                     // 先还用户选区
-            txtResult.SelectionStart = txtResult.TextLength;        // 再把"插入点颜色"复位
-            txtResult.SelectionLength = 0;
-            txtResult.SelectionColor = txtResult.ForeColor;         // 不改这行，后续 AppendText 会变成蓝色
-            txtResult.Select(selStart, selLen);
-            try { SendMessage(txtResult.Handle, EM_SETSCROLLPOS, 0, ref sp); } catch { }
+            SendMessage(txtResult.Handle, WM_SETREDRAW, 0, System.IntPtr.Zero);
+            try {
+                txtResult.Select(start, len);
+                txtResult.SelectionColor = c;
+                txtResult.Select(selStart, selLen);
+            } finally {
+                SendMessage(txtResult.Handle, WM_SETREDRAW, 1, System.IntPtr.Zero);
+                try { SendMessage(txtResult.Handle, EM_SETSCROLLPOS, 0, ref sp); } catch { }
+                txtResult.Invalidate();
+            }
+        }
+
+        // 复原悬停高亮：按记录的【精确字符范围】还色，不按行号猜。
+        // 追加输出不会改动已有行的字节，所以这个范围在追加后依然指向同一行；
+        // 整框清空/换内容时范围越界会被夹住，多还的部分本来就是默认色，无害。
+        private void ClearHot() {
+            int st = s_hotStart, ln = s_hotLen;
+            s_hotStart = -1; s_hotLen = 0; s_hoverLine = -1;
+            if (st < 0 || ln <= 0) return;
+            try {
+                int total = txtResult.TextLength;
+                if (st >= total) return;
+                if (st + ln > total) ln = total - st;
+                if (ln <= 0) return;
+                PaintRange(st, ln, txtResult.ForeColor);
+            } catch { }
+        }
+
+        // 结果框的命中行判定：先按字符坐标算行，再校验鼠标 Y 是否真落在这行的行高内。
+        // 不做这道校验，列表下方的空白会把最后一行点亮、行边界附近会在相邻两行间反复横跳（=乱抖）。
+        private int HoverLineAt(System.Windows.Forms.MouseEventArgs e) {
+            int ci = txtResult.GetCharIndexFromPosition(e.Location);
+            int li = txtResult.GetLineFromCharIndex(ci);
+            if (li < 0) return -1;
+            string[] lines = txtResult.Lines;
+            if (li >= lines.Length) return -1;
+            int start = txtResult.GetFirstCharIndexFromLine(li);
+            if (start < 0) return -1;
+            int top = txtResult.GetPositionFromCharIndex(start).Y;
+            if (e.Y < top || e.Y >= top + txtResult.Font.Height) return -1;
+            return ExtractHitPath(lines[li]) != null ? li : -1;
         }
 
         // 追加输出。AppendText 会沿用"当前插入点颜色"，所以每次都先把颜色复位成默认，
