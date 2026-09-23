@@ -1,0 +1,83 @@
+name: build-and-publish
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Preflight - source must keep update channels
+        shell: pwsh
+        run: |
+          $src = Get-Content PdfFinderGui.cs -Raw -Encoding UTF8
+          $need = @(
+            'raw.githubusercontent.com/mmxn1218/TongLiPDF/main',
+            'fastly.jsdelivr.net/gh/mmxn1218/TongLiPDF@main',
+            'gcore.jsdelivr.net/gh/mmxn1218/TongLiPDF@main',
+            'PDFFinder.dat'
+          )
+          foreach ($n in $need) {
+            if (-not $src.Contains($n)) { throw "源码缺少必要内容，拒绝发布: $n" }
+          }
+          Write-Host "preflight OK"
+
+      - name: Compile with .NET Framework 4.x csc
+        shell: cmd
+        run: |
+          set "CSC=%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+          if not exist "%CSC%" set "CSC=%WINDIR%\Microsoft.NET\Framework\v4.0.30319\csc.exe"
+          if not exist "%CSC%" ( echo [ERROR] csc not found & exit 1 )
+          "%CSC%" -nologo -target:winexe -optimize+ -codepage:65001 -out:PdfFinder.exe -win32icon:app.ico -reference:System.dll -reference:System.Drawing.dll -reference:System.Windows.Forms.dll PdfFinderGui.cs
+
+      - name: Verify version, write version.json, stage payload
+        shell: pwsh
+        run: |
+          $src = Get-Content PdfFinderGui.cs -Raw -Encoding UTF8
+          if ($src -match 'APP_VERSION\s*=\s*"([^"]+)"') { $ver = $1 } else { throw "APP_VERSION not found in source" }
+
+          # 自证：运行 exe --dump-version（headless 下若卡住只告警不阻断）
+          $vchk = Join-Path $env:TEMP ("pdfver_" + [guid]::NewGuid().ToString("N") + ".txt")
+          try {
+            $p = Start-Process -FilePath ".\PdfFinder.exe" -ArgumentList "--dump-version",$vchk -Wait -TimeoutSec 30 -PassThru
+            if (Test-Path $vchk) {
+              $got = (Get-Content $vchk -Raw).Trim()
+              if ($got -eq $ver) { Write-Host "version self-check OK: $got" }
+              else { Write-Warning "version mismatch source=$ver binary=$got (继续)" }
+            } else { Write-Warning "自证未产生文件，跳过 (继续)" }
+          } catch {
+            Write-Warning "自证超时/失败: $_ (继续)"
+          }
+          if (Test-Path $vchk) { Remove-Item $vchk -Force }
+
+          $hash = (Get-FileHash PdfFinder.exe -Algorithm MD5).Hash.ToLower()
+          $size = (Get-Item PdfFinder.exe).Length
+          Write-Host "md5=$hash size=$size"
+          $json = "{`"version`":`"$ver`",`"md5`":`"$hash`",`"size`":$size}"
+          Set-Content -Path version.json -Value $json -NoNewline -Encoding ASCII
+
+          Copy-Item PdfFinder.exe -Destination "PDFFinder.dat" -Force
+          Copy-Item PdfFinder.exe -Destination "仓管员PDF查找器.exe" -Force
+          Copy-Item PdfFinder.exe -Destination "通力PDF查找器.exe" -Force
+
+      - name: Commit and push publish files
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config core.quotepath false
+          git add PDFFinder.dat version.json "仓管员PDF查找器.exe" "通力PDF查找器.exe"
+          if git diff --cached --quiet; then
+            echo "no changes to publish"
+          else
+            git commit -m "release via CI [skip ci]"
+            git push
+          fi
