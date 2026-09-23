@@ -66,7 +66,6 @@ jobs:
 
           Copy-Item PdfFinder.exe -Destination "PDFFinder.dat" -Force
           Copy-Item PdfFinder.exe -Destination "仓管员PDF查找器.exe" -Force
-          Copy-Item PdfFinder.exe -Destination "通力PDF查找器.exe" -Force
 
       - name: Commit and push publish files
         shell: bash
@@ -74,7 +73,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config core.quotepath false
-          git add PDFFinder.dat version.json "仓管员PDF查找器.exe" "通力PDF查找器.exe"
+          git add PDFFinder.dat version.json "仓管员PDF查找器.exe"
           if git diff --cached --quiet; then
             echo "no changes to publish"
           else

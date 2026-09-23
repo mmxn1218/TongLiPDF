@@ -134,7 +134,7 @@ namespace PdfFinder {
         }
 
         // ================= 自动更新（对标 update.c 机制）=================
-        public const string APP_VERSION = "2026.09.23.0013";   // 本地版本（YYYY.MM.DD.SEQ），唯一版本来源
+        public const string APP_VERSION = "2026.09.23.0014";   // 本地版本（YYYY.MM.DD.SEQ），唯一版本来源
         // 更新源（顺序即优先级），严格对齐 mes_每日执行 的 update.c / update.h。
         // 【2026-09-23】源列表与顺序一改之前"我自己挑的 4 个"，直接照抄 MES 的 5 个：
         //   raw → fastly → gcore → testingcf → cdn
@@ -166,7 +166,7 @@ namespace PdfFinder {
         // 共享里允许用这几种文件名，内容一致，方便直接把 exe 拷进去。
         // 网络源只认 UPDATE_FILE（jsDelivr 对 .exe 一律 403）。
         static readonly string[] PAYLOAD_LEAVES = new string[] {
-            UPDATE_FILE, "仓管员PDF查找器.exe", "通力PDF查找器.exe"
+            UPDATE_FILE, "仓管员PDF查找器.exe"
         };
 
         // 本地源（UNC 共享 / 盘符路径）不能用 WebClient，要走 File.*
