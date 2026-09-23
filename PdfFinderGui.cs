@@ -26,6 +26,18 @@ namespace PdfFinder {
                     Updater.Run(pid, args[2]);
                 return;
             }
+            // 【2026-09-23】显式启用 TLS 1.2。
+            // 老 .NET(4.6 及以下) 默认 SecurityProtocol = Ssl3|Tls，只开 TLS 1.0；
+            // 而 GitHub/raw 强制 TLS 1.2+，握手会被直接拒 → 日志里的
+            // "请求被中止: 未能创建 SSL/TLS 安全通道"。这里只在"当前值不是 SystemDefault(0)
+            // 且确实不含 TLS1.2"时才补，新 .NET(4.7+，值为 0=SystemDefault) 保持不动
+            // （这样 TLS 1.3 仍能协商，不会被写死成只认 1.2）。
+            try {
+                int sp = (int)System.Net.ServicePointManager.SecurityProtocol;
+                if (sp != 0 && (sp & 3072) != 3072)   // 3072 = SecurityProtocolType.Tls12
+                    System.Net.ServicePointManager.SecurityProtocol =
+                        (System.Net.SecurityProtocolType)(sp | 3072 | 768);
+            } catch { }
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new MainForm());
@@ -43,10 +55,22 @@ namespace PdfFinder {
     // 配合 raw 命中即早退（源1成功就不再试后面），正常路径依然是一秒内出结果。
     class TimeoutWebClient : System.Net.WebClient {
         public int TimeoutMs = 60000;
+        // 【2026-09-23 现场实测定位的根因】更新请求默认【直连】，不走本机代理。
+        // 现场现象：程序日志里 raw 一路永远"取失败：请求被中止: 未能创建 SSL/TLS 安全通道"，
+        // 于是只能落到 jsDelivr 边缘节点，而那些节点给的是【滞后】的旧版本号 →
+        // 判成"已是最新" → 永远升不上去。
+        // 真因不是墙、也不是 TLS 版本：本机 IE 代理开着（ProxyServer=127.0.0.1:10808，
+        // 一个本机代理/VPN 工具），而 .NET 的 WebClient 默认继承它（WebRequest.DefaultWebProxy
+        // 读的就是 IE 设置），该代理把 raw.githubusercontent.com 路由到一个失效节点 → 握手被拒。
+        // 同一台机器【直连】(curl --noproxy '*') 实测 200 / 0.28s，DNS 也解析到 GitHub 真实 IP。
+        // 工厂内网/家庭宽带都是 NAT 直出，不需要代理；让更新链路跟着一个个人代理工具的开关抖动
+        // 是不可接受的。故：直连优先，失败再退回系统代理（见 NewClient / FetchTextSmart）。
+        public bool UseSystemProxy = false;
         protected override System.Net.WebRequest GetWebRequest(Uri address) {
             var r = base.GetWebRequest(address);
             if (r != null) {
                 r.Timeout = TimeoutMs;
+                if (!UseSystemProxy) r.Proxy = null;   // 直连：绕开 IE/系统代理
                 var h = r as System.Net.HttpWebRequest;
                 if (h != null) h.ReadWriteTimeout = TimeoutMs;
             }
@@ -55,10 +79,14 @@ namespace PdfFinder {
     }
 
     class MainForm : Form {
-        private TextBox txtPath, txtNumber, txtResult;
+        private TextBox txtPath, txtNumber;
+        // 结果框用 RichTextBox（而不是 TextBox）：只有富文本才能对【单行】改颜色，
+        // 潘工要的"鼠标指着扫描出的文件地址时该行变蓝"这个反馈，TextBox 做不到。
+        private RichTextBox txtResult;
         private Button btnBrowse, btnRun;
         private Label lblResult;
         private volatile bool s_cancel = false;   // 暂停/取消扫描标志
+        private int s_hoverLine = -1;             // 当前鼠标悬停的结果行（-1=无），用于悬停高亮反馈
 
         public MainForm() {
             Text = "仓管员PDF查找器 v" + APP_VERSION;
@@ -74,7 +102,7 @@ namespace PdfFinder {
             // 简介
             var intro = new TextBox {
                 Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical,
-                Text = "【仓管员PDF查找器】\r\n\r\n使用步骤：\r\n1. 填写或浏览选择文件夹位置。\r\n2. 输入编号（如 W080300-104240）。\r\n3. 点击“执行”，下方实时列出所有正文含该编号的 PDF 路径。\r\n4. 双击结果中的某条路径，可直接打开该文件；若其所在文件夹当前没打开，会一并打开文件夹并选中该文件。",
+                Text = "【仓管员PDF查找器】\r\n\r\n使用步骤：\r\n1. 填写或浏览选择文件夹位置。\r\n2. 输入编号（如 W080300-104240）。\r\n3. 点击“执行”，下方实时列出所有正文含该编号的 PDF 路径。\r\n4. 双击结果中的某条路径，可直接打开该文件；若其所在文件夹当前没打开，会一并打开文件夹并选中该文件。\r\n（鼠标移到某个文件地址上，该行会变蓝，表示这里可以双击。）",
                 Location = new System.Drawing.Point(12, 12), Size = new System.Drawing.Size(596, 120),
                 Font = new System.Drawing.Font("Microsoft YaHei", 10F)
             };
@@ -88,9 +116,10 @@ namespace PdfFinder {
             btnRun = new Button { Text = "执行", Location = new System.Drawing.Point(bx + w1 + 6, 186), Size = new System.Drawing.Size(80, 27), Font = Font };
 
             lblResult = new Label { Text = "查找结果：", AutoSize = true, Location = new System.Drawing.Point(15, 228), Font = Font };
-            txtResult = new TextBox {
-                Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both,
-                AcceptsReturn = true, WordWrap = false,
+            txtResult = new RichTextBox {
+                ReadOnly = true, ScrollBars = RichTextBoxScrollBars.Both,
+                WordWrap = false, DetectUrls = false,               // 关掉自动识别 URL，避免路径被自动染蓝干扰
+                BackColor = System.Drawing.SystemColors.Window,
                 Location = new System.Drawing.Point(15, 250), Size = new System.Drawing.Size(590, 195),
                 Font = new System.Drawing.Font("Microsoft YaHei", 10F)
             };
@@ -122,6 +151,26 @@ namespace PdfFinder {
                     MessageBox.Show("打开失败：" + ex.Message, "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 }
             };
+            // 悬停反馈（潘工 2026-09-23）：鼠标移到某条【文件地址】上时该行变蓝，
+            // 提示"这里可以双击打开"。TextBox 做不到，故结果框已换成 RichTextBox。
+            // 只有真正是命中文件行（ExtractHitPath 认得出来）才点亮，状态/统计文字不点亮。
+            txtResult.MouseMove += (s, e) => {
+                try {
+                    int ci = txtResult.GetCharIndexFromPosition(e.Location);
+                    int li = txtResult.GetLineFromCharIndex(ci);
+                    if (li == s_hoverLine) return;              // 还在同一行：什么都不做，避免反复着色闪烁
+                    string[] lines = txtResult.Lines;
+                    bool isHit = (li >= 0 && li < lines.Length && ExtractHitPath(lines[li]) != null);
+                    SetLineHot(s_hoverLine, false);             // 先复原上一行
+                    s_hoverLine = isHit ? li : -1;              // 只有命中行才进入高亮态
+                    SetLineHot(s_hoverLine, true);              // 再点亮当前行
+                } catch { }
+            };
+            txtResult.MouseLeave += (s, e) => {
+                try { SetLineHot(s_hoverLine, false); } catch { }
+                s_hoverLine = -1;
+            };
+            txtResult.TextChanged += (s, e) => { s_hoverLine = -1; };   // 内容变了(新一轮扫描)，悬停态作废
             this.Shown += (s, e) => {
                 string ed = System.IO.Path.GetDirectoryName(Application.ExecutablePath);
                 // 启动就留一条痕（对标 MES 的 upd_log）。现场"打开软件没反应"时，
@@ -134,18 +183,26 @@ namespace PdfFinder {
         }
 
         // ================= 自动更新（对标 update.c 机制）=================
-        public const string APP_VERSION = "2026.09.23.0014";   // 本地版本（YYYY.MM.DD.SEQ），唯一版本来源
-        // 更新源（顺序即优先级），严格对齐 mes_每日执行 的 update.c / update.h。
-        // 【2026-09-23】源列表与顺序一改之前"我自己挑的 4 个"，直接照抄 MES 的 5 个：
-        //   raw → fastly → gcore → testingcf → cdn
-        // cdn 本机实测在国内是 TLS 直连被重置（0.18s 就断），但 MES 现场跑通时它就是留着的，
-        // 且排在最后——只在前面 4 个全挂时才会轮到，多花的时间只出现在"本来就已经失败"的路径上。
-        // 原则：先跟成功案例完全一致，跑通了再谈精简。
-        // 2026-09-22 本机实测（同一仓库、同一时刻，各源按自己正确的路径格式请求）：
-        //   raw.githubusercontent.com        → 200 / 0.79s，**且 .exe 也能下发**（raw 是纯文件服务，不做类型拦截）
-        //   fastly / gcore / testingcf .jsdelivr.net → 200 / 0.3~3s，但 **.exe 一律 403**，只认 .dat
+        public const string APP_VERSION = "2026.09.23.0015";   // 本地版本（YYYY.MM.DD.SEQ），唯一版本来源
+        // 更新源（顺序即优先级）。
+        // 【2026-09-23 现场实测定版】原方案照抄 MES 的 5 个(raw → fastly → gcore → testingcf → cdn)，
+        // 但今天定位到一个 MES 那边没暴露的问题：**jsDelivr 对 @main 分支文件的缓存最长 12 小时**。
+        // 实测：源码与 version.json 明明已经是 0014，fastly 节点却仍回 0009
+        // （连加 ?v= 破缓存、调 purge API 都没用），客户端一看"远端 0009 ≤ 本地 0013"
+        // 就判"已是最新"——发出去的新版根本推不下去。
+        // 而原来的第 1 源 raw 因为程序继承了本机 IE 代理(127.0.0.1:10808)而永远握手失败：
+        // 唯一"不缓存"的源一挂，就只剩"会缓存"的源，必然卡死。这是今天"发了 0014 却升不上去"的真因。
+        // 对策两条：
+        //   ① 更新请求默认【直连】，不继承本机代理（见 TimeoutWebClient.UseSystemProxy）；
+        //   ② 再加一个**同样不缓存**的权威源：GitHub API 的 contents 接口（源2）。
+        // 这样"不缓存且最新"的源有两条，域名与路径都不同，抗单点故障。
+        // 2026-09-22/23 本机实测：
+        //   raw.githubusercontent.com   → 直连 200 / 0.28s（权威、不缓存）
+        //   api.github.com (contents)   → 200（权威、不缓存；返回 JSON+base64，程序自动解开）
+        //   *.jsdelivr.net              → 200 / 0.1~3s，但会缓存、可能滞后；.exe 一律 403，只认 .dat
         static readonly string[] UPDATE_BASE = new string[] {
             "https://raw.githubusercontent.com/mmxn1218/TongLiPDF/main",
+            "https://api.github.com/repos/mmxn1218/TongLiPDF/contents",
             "https://fastly.jsdelivr.net/gh/mmxn1218/TongLiPDF@main",
             "https://gcore.jsdelivr.net/gh/mmxn1218/TongLiPDF@main",
             "https://testingcf.jsdelivr.net/gh/mmxn1218/TongLiPDF@main",
@@ -251,7 +308,76 @@ namespace PdfFinder {
                 System.IO.File.Copy(src, dest, true);
                 return;
             }
+            // GitHub contents API 给的是 JSON（内容在 content 字段、base64 编码），
+            // 不能当二进制直接存盘，要先解开再写。
+            if (IsGitHubApi(bas)) {
+                string json = wc.DownloadString(AppendLeaf(bas, leaf) + bust);
+                byte[] bin = UnwrapApiContent(json);
+                if (bin == null) throw new System.Exception("API 响应里没有可用的 content 字段");
+                System.IO.File.WriteAllBytes(dest, bin);
+                return;
+            }
             wc.DownloadFile(AppendLeaf(bas, leaf) + bust, dest);
+        }
+
+        // 判断是否 GitHub API 的 contents 接口（返回 JSON + base64，而不是纯文件）
+        static bool IsGitHubApi(string bas) {
+            return bas != null && bas.IndexOf("api.github.com/repos/", System.StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        // 统一造客户端。直连/走系统代理 由 useSystemProxy 决定。
+        static TimeoutWebClient NewClient(bool useSystemProxy) {
+            var wc = new TimeoutWebClient();
+            wc.Encoding = System.Text.Encoding.UTF8;
+            wc.UseSystemProxy = useSystemProxy;
+            wc.Headers.Add("User-Agent", "PdfFinder-Updater");
+            return wc;
+        }
+
+        // 从 GitHub contents API 的 JSON 包里取出文件二进制（content 字段是 base64）。
+        // 只保留 base64 合法字符，\n / 空格等一律丢掉。
+        static byte[] UnwrapApiContent(string json) {
+            if (string.IsNullOrEmpty(json)) return null;
+            var m = System.Text.RegularExpressions.Regex.Match(json, "\"content\"\\s*:\\s*\"([^\"]*)\"");
+            if (!m.Success) return null;
+            var sb = new System.Text.StringBuilder();
+            foreach (char c in m.Groups[1].Value) {
+                if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '+' || c == '/' || c == '=') sb.Append(c);
+            }
+            if (sb.Length == 0) return null;
+            try { return System.Convert.FromBase64String(sb.ToString()); } catch { return null; }
+        }
+
+        // 把取回来的内容规整成"真正的 version.json 文本"：
+        // 明文清单原样返回；GitHub API 的 JSON 包则解开 base64 后当清单用。
+        static string UnwrapManifest(string raw) {
+            if (raw == null) return null;
+            if (System.Text.RegularExpressions.Regex.IsMatch(raw, "\"version\"\\s*:\\s*\"")) return raw;
+            byte[] bin = UnwrapApiContent(raw);
+            if (bin == null) return raw;
+            try { return System.Text.Encoding.UTF8.GetString(bin); } catch { return raw; }
+        }
+
+        // 取文本：网络源【直连优先，失败退回系统代理】。
+        // 直连优先的原因见 TimeoutWebClient 的注释（本机 IE 代理会把 raw 路由到失效节点）；
+        // 退回系统代理是为了兼容"内网必须走代理才能出公网"的机器。
+        static string FetchTextSmart(string bas, string leaf, string bust, out string lastErr) {
+            lastErr = null;
+            for (int pass = 0; pass < 2; pass++) {
+                try { return FetchText(NewClient(pass != 0), bas, leaf, bust); }
+                catch (System.Exception ex) { lastErr = ex.Message + (pass == 0 ? "（直连）" : "（经系统代理）"); }
+            }
+            return null;
+        }
+
+        // 下载载荷：同样【直连优先，失败退回系统代理】。返回是否成功。
+        static bool FetchFileSmart(string bas, string leaf, string bust, string dest, out string lastErr) {
+            lastErr = null;
+            for (int pass = 0; pass < 2; pass++) {
+                try { FetchFile(NewClient(pass != 0), bas, leaf, bust, dest); return true; }
+                catch (System.Exception ex) { lastErr = ex.Message + (pass == 0 ? "（直连）" : "（经系统代理）"); }
+            }
+            return false;
         }
 
         // 逐段比较 YYYY.MM.DD.SEQ，返回 -1/0/1
@@ -286,9 +412,6 @@ namespace PdfFinder {
                     // 某个节点给出的还是旧版本号，只取一个会漏掉更新；取最大值最稳。
                     // 加 ?v=<秒级时间戳> 破 jsDelivr 边缘缓存（本地共享源会忽略这个参数）。
                     string bust = "?v=" + Epoch();
-                    var wc = new TimeoutWebClient();
-                    wc.Encoding = System.Text.Encoding.UTF8;
-                    wc.Headers.Add("User-Agent", "PdfFinder-Updater");
                     var errs = new System.Collections.Generic.List<string>();
                     string bestJson = null, bestVer = null;
                     // 【2026-09-23 对齐 MES】日志粒度提到 update.c 的水平：每个源单列一行，
@@ -300,7 +423,10 @@ namespace PdfFinder {
                         string baseUrl = sources[si];
                         var sw = System.Diagnostics.Stopwatch.StartNew();
                         try {
-                            string json = FetchText(wc, baseUrl, "version.json", bust);
+                            string ferr;
+                            string json = FetchTextSmart(baseUrl, "version.json", bust, out ferr);
+                            if (json == null) throw new System.Exception(ferr ?? "未知失败");
+                            json = UnwrapManifest(json);   // GitHub API 源回来的是 JSON 包，这里解开成真正的清单
                             sw.Stop();
                             var mv = System.Text.RegularExpressions.Regex.Match(json, "\"version\"\\s*:\\s*\"([^\"]+)\"");
                             if (!mv.Success) {
@@ -392,7 +518,7 @@ namespace PdfFinder {
 
         private void DownloadAndApply(string ver, string md5, long size) {
             this.BeginInvoke((Action)(() => {
-                txtResult.AppendText("\r\n发现新版本 " + ver + "，正在自动更新...\r\n");
+                AppendOut("\r\n发现新版本 " + ver + "，正在自动更新...\r\n");
                 lblResult.Text = "正在更新...";
             }));
             string exePath = Application.ExecutablePath;                       // 当前 exe 完整路径
@@ -418,9 +544,9 @@ namespace PdfFinder {
                     foreach (string leaf in leaves) {
                         var sw = System.Diagnostics.Stopwatch.StartNew();
                         try {
-                            var wc = new TimeoutWebClient();
-                            wc.Headers.Add("User-Agent", "PdfFinder-Updater");
-                            FetchFile(wc, baseUrl, leaf, bust2, tmpNew);
+                            string derr;
+                            if (!FetchFileSmart(baseUrl, leaf, bust2, tmpNew, out derr))
+                                throw new System.Exception(derr ?? "未知失败");
                         } catch (System.Exception ex) {
                             sw.Stop();
                             Updater.Log(exeDir, "下载 源" + (si + 1) + "/" + srcs.Length + " " + baseUrl + " / " + leaf
@@ -496,7 +622,7 @@ namespace PdfFinder {
                 Updater.Log(exeDir, "已下载并校验 " + ver + "，交给更新器接管");
                 // 4) 启动更新器 → 立刻退出自身，把文件锁让出来
                 this.BeginInvoke((Action)(() => {
-                    txtResult.AppendText("更新包校验通过，正在重启替换...\r\n");
+                    AppendOut("更新包校验通过，正在重启替换...\r\n");
                     lblResult.Text = "正在更新...";
                     try {
                         var psi = new System.Diagnostics.ProcessStartInfo(updater,
@@ -520,7 +646,7 @@ namespace PdfFinder {
         private void Notify(string msg) {
             try {
                 this.BeginInvoke((Action)(() => {
-                    txtResult.AppendText("[自动更新] " + msg + "\r\n");
+                    AppendOut("[自动更新] " + msg + "\r\n");
                 }));
             } catch { }
         }
@@ -534,6 +660,50 @@ namespace PdfFinder {
                     lblResult.Text = msg;
                 }));
             } catch { }
+        }
+
+        // ===== 悬停高亮：把结果框某一行染蓝/复原 =====
+        // 用 EM_GETSCROLLPOS/EM_SETSCROLLPOS 存取滚动位置：着色要走 Select()，
+        // 而 Select 可能把视图带走；GET 和 SET 用的是同一套坐标单位，原样存取即可还原，
+        // 不需要知道它是像素还是 twips。悬停只是"给个反馈"，绝不能把视图/选区弄乱。
+        [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Auto)]
+        private static extern int SendMessage(IntPtr hWnd, int msg, int wParam, ref POINT lParam);
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        private struct POINT { public int X; public int Y; }
+        private const int EM_GETSCROLLPOS = 0x04DD;
+        private const int EM_SETSCROLLPOS = 0x04DE;
+
+        // 把结果框第 line 行染蓝(hot=true)/还原(hot=false)。line<0 时什么都不做。
+        private void SetLineHot(int line, bool hot) {
+            if (line < 0) return;
+            string[] lines = txtResult.Lines;
+            if (line >= lines.Length) return;
+            int start = txtResult.GetFirstCharIndexFromLine(line);
+            if (start < 0) return;
+            int len = lines[line].Length;
+            if (len <= 0) return;
+            var sp = new POINT();
+            try { SendMessage(txtResult.Handle, EM_GETSCROLLPOS, 0, ref sp); } catch { }
+            int selStart = txtResult.SelectionStart, selLen = txtResult.SelectionLength;
+            txtResult.Select(start, len);
+            txtResult.SelectionColor = hot ? System.Drawing.Color.Blue : txtResult.ForeColor;
+            txtResult.Select(selStart, selLen);                     // 先还用户选区
+            txtResult.SelectionStart = txtResult.TextLength;        // 再把"插入点颜色"复位
+            txtResult.SelectionLength = 0;
+            txtResult.SelectionColor = txtResult.ForeColor;         // 不改这行，后续 AppendText 会变成蓝色
+            txtResult.Select(selStart, selLen);
+            try { SendMessage(txtResult.Handle, EM_SETSCROLLPOS, 0, ref sp); } catch { }
+        }
+
+        // 追加输出。AppendText 会沿用"当前插入点颜色"，所以每次都先把颜色复位成默认，
+        // 避免上一次悬停留下的蓝色把新追加的文字也染蓝。
+        private void AppendOut(string s) {
+            try {
+                txtResult.SelectionStart = txtResult.TextLength;
+                txtResult.SelectionLength = 0;
+                txtResult.SelectionColor = txtResult.ForeColor;
+            } catch { }
+            txtResult.AppendText(s);
         }
 
         private static string Md5Hex(System.IO.Stream s, System.Security.Cryptography.MD5 md5) {
@@ -550,7 +720,7 @@ namespace PdfFinder {
                 s_cancel = true;
                 btnRun.Text = "执行";
                 btnRun.Enabled = false;   // 等待线程收尾再恢复
-                txtResult.AppendText("\r\n正在暂停...（本次结果保留）\r\n");
+                AppendOut("\r\n正在暂停...（本次结果保留）\r\n");
                 lblResult.Text = "查找结果：正在暂停...";
                 return;
             }
@@ -618,9 +788,9 @@ namespace PdfFinder {
             bw.ProgressChanged += (s2, e2) => {
                 string msg = (string)e2.UserState;
                 if (msg.StartsWith("MATCH:")) {
-                    txtResult.AppendText(msg.Substring(6) + "\r\n");
+                    AppendOut(msg.Substring(6) + "\r\n");
                 } else if (msg.StartsWith("COUNT:")) {
-                    txtResult.AppendText("找到 " + msg.Substring(6) + " 个 PDF，开始扫描...\r\n");
+                    AppendOut("找到 " + msg.Substring(6) + " 个 PDF，开始扫描...\r\n");
                     lblResult.Text = "查找结果：正在扫描 " + msg.Substring(6) + " 个 PDF...";
                 } else if (msg.StartsWith("SCAN:")) {
                     lblResult.Text = "查找结果：正在扫描 " + msg.Substring(5) + " ...";
@@ -629,12 +799,12 @@ namespace PdfFinder {
                     int hits = int.Parse(parts[0]), total = int.Parse(parts[1]);
                     string needle2 = parts.Length > 2 ? parts[2] : "";
                     if (s_cancel) {
-                        txtResult.AppendText("\r\n已暂停，扫描了 " + total + " 个 PDF，命中 " + hits + " 个。（可重新点执行继续新一轮）\r\n");
+                        AppendOut("\r\n已暂停，扫描了 " + total + " 个 PDF，命中 " + hits + " 个。（可重新点执行继续新一轮）\r\n");
                     } else {
                         if (hits == 0) {
-                            txtResult.AppendText("\r\n未找到正文包含编号 \"" + needle2 + "\" 的 PDF 文件。");
+                            AppendOut("\r\n未找到正文包含编号 \"" + needle2 + "\" 的 PDF 文件。");
                         }
-                        txtResult.AppendText("\r\n扫描完成，共 " + total + " 个 PDF，命中 " + hits + " 个。" + (hits == 0 ? "" : "（按最新优先，已实时列出）") + "\r\n");
+                        AppendOut("\r\n扫描完成，共 " + total + " 个 PDF，命中 " + hits + " 个。" + (hits == 0 ? "" : "（按最新优先，已实时列出）") + "\r\n");
                     }
                     lblResult.Text = "查找结果：";
                 }

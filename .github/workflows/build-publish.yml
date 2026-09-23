@@ -19,8 +19,11 @@ jobs:
         shell: pwsh
         run: |
           $src = Get-Content PdfFinderGui.cs -Raw -Encoding UTF8
+          # 两个"不缓存"的权威源必须都在：raw 与 GitHub API 的 contents 接口。
+          # 少任何一个都可能让客户端只能落到会滞后的 jsDelivr 镜像上，从而"发了新版却升不上去"。
           $need = @(
             'raw.githubusercontent.com/mmxn1218/TongLiPDF/main',
+            'api.github.com/repos/mmxn1218/TongLiPDF/contents',
             'fastly.jsdelivr.net/gh/mmxn1218/TongLiPDF@main',
             'gcore.jsdelivr.net/gh/mmxn1218/TongLiPDF@main',
             'PDFFinder.dat'
@@ -80,3 +83,16 @@ jobs:
             git commit -m "release via CI [skip ci]"
             git push
           fi
+
+      - name: Purge jsDelivr cache so mirrors refresh fast
+        shell: bash
+        run: |
+          # jsDelivr 对 @main 分支文件的缓存最长 12 小时：实测发完新版后 fastly 节点仍回旧版本号，
+          # 客户端据此判"已是最新"就升不上去。发版后主动 purge，让 4 个 jsdelivr 镜像尽快刷新。
+          # （raw 与 GitHub API 两个源本来就不做 CDN 缓存，不受影响；purge 失败也不影响发布。）
+          for p in version.json PDFFinder.dat; do
+            echo "== purge $p =="
+            curl -s -m 30 "https://purge.jsdelivr.net/gh/mmxn1218/TongLiPDF@main/$p" || true
+            echo
+          done
+          echo "purge done"
