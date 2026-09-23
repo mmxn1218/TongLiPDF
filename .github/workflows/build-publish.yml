@@ -42,7 +42,7 @@ jobs:
         shell: pwsh
         run: |
           $src = Get-Content PdfFinderGui.cs -Raw -Encoding UTF8
-          if ($src -match 'APP_VERSION\s*=\s*"([^"]+)"') { $ver = $1 } else { throw "APP_VERSION not found in source" }
+          if ($src -match 'APP_VERSION\s*=\s*"([^"]+)"') { $ver = $matches[1] } else { throw "APP_VERSION not found in source" }
 
           # 自证：运行 exe --dump-version（headless 下若卡住只告警不阻断）
           $vchk = Join-Path $env:TEMP ("pdfver_" + [guid]::NewGuid().ToString("N") + ".txt")
