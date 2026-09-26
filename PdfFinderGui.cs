@@ -104,7 +104,7 @@ namespace PdfFinder {
             // 简介
             var intro = new TextBox {
                 Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical,
-                Text = "【仓管员PDF查找器】\r\n\r\n使用步骤：\r\n1. 填写或浏览选择文件夹位置。\r\n2. 输入编号（如 W080300-104240，或送货清单号 DL26092402497）。\r\n3. 点击“执行”，下方实时列出所有文件名或正文含该编号的 PDF 路径。\r\n4. 双击结果中的某条路径，可直接打开该文件；若其所在文件夹当前没打开，会一并打开文件夹并选中该文件。\r\n（鼠标移到某个文件地址上，该行会变蓝，表示这里可以双击。）",
+                Text = "【仓管员PDF查找器】\r\n\r\n使用步骤：\r\n1. 填写或浏览选择文件夹位置。\r\n2. 输入编号（如 W080300-104240，或送货清单号 DL26092402497）。\r\n3. 点击“执行”，下方实时列出所有文件名或正文含该编号的 PDF 路径（送货清单号 DL... 唯一，命中即自动停止扫描）。\r\n4. 双击结果中的某条路径，可直接打开该文件；若其所在文件夹当前没打开，会一并打开文件夹并选中该文件。\r\n（鼠标移到某个文件地址上，该行会变蓝，表示这里可以双击。）",
                 Location = new System.Drawing.Point(12, 12), Size = new System.Drawing.Size(596, 120),
                 Font = new System.Drawing.Font("Microsoft YaHei", 10F)
             };
@@ -189,7 +189,7 @@ namespace PdfFinder {
         }
 
         // ================= 自动更新（对标 update.c 机制）=================
-        public const string APP_VERSION = "2026.09.26.0018";   // 本地版本（YYYY.MM.DD.SEQ），唯一版本来源
+        public const string APP_VERSION = "2026.09.26.0019";   // 本地版本（YYYY.MM.DD.SEQ），唯一版本来源
         // 更新源（顺序即优先级）。
         // 【2026-09-23 现场实测定版】原方案照抄 MES 的 5 个(raw → fastly → gcore → testingcf → cdn)，
         // 但今天定位到一个 MES 那边没暴露的问题：**jsDelivr 对 @main 分支文件的缓存最长 12 小时**。
@@ -803,6 +803,10 @@ namespace PdfFinder {
                 });
                 bw.ReportProgress(0, "COUNT:" + list.Count);
                 int total = 0, hits = 0;
+                // 送货清单号唯一（潘工 2026-09-26）：编号以 DL 开头即视为送货清单号，命中一个就停，
+                // 不需要把全部文件扫完——它不会有第二份。
+                bool isDl = needle.StartsWith("DL", System.StringComparison.OrdinalIgnoreCase);
+                bool dlstop = false;
                 // 文件名预扫（0018）：把"名字就含编号"的文件全部立即报出，一个文件都不用读。
                 // 没有这一步，搜送货清单号（DL...）时结果要等主循环把排在 DL 档之前的
                 // 全部 report 文件读完正文才出现——功能能用但结果等到最后才出，等于难用。
@@ -815,6 +819,12 @@ namespace PdfFinder {
                         byName.Add(f.FullName);
                         bw.ReportProgress(0, "MATCH:" + FileLine(f));
                     }
+                }
+                // 送货清单号唯一：文件名已命中就不必再读其余文件正文，直接收工（预扫零读取，零成本）。
+                if (isDl && byName.Count > 0) {
+                    bw.ReportProgress(0, "DONE:" + hits + ":" + total + ":" + needle + ":DLSTOP");
+                    e2.Result = null;
+                    return;
                 }
                 foreach (var f in list) {
                     if (s_cancel) break;   // 用户点了暂停
@@ -834,12 +844,13 @@ namespace PdfFinder {
                             hits++;
                             // 命中一个立即输出，不等全部扫完；附创建/修改时间便于辨认被改过或重命名的文件
                             bw.ReportProgress(0, "MATCH:" + FileLine(f));
+                            if (isDl) { dlstop = true; break; }   // 送货清单号唯一：命中即停，不扫完
                         }
                     } catch { }
                     if (total % 10 == 0)
                         bw.ReportProgress(0, "SCAN:" + total + "/" + list.Count);
                 }
-                bw.ReportProgress(0, "DONE:" + hits + ":" + total + ":" + needle);
+                bw.ReportProgress(0, "DONE:" + hits + ":" + total + ":" + needle + (dlstop ? ":DLSTOP" : ""));
                 e2.Result = null;
             };
             bw.ProgressChanged += (s2, e2) => {
@@ -855,8 +866,11 @@ namespace PdfFinder {
                     var parts = msg.Substring(5).Split(':');
                     int hits = int.Parse(parts[0]), total = int.Parse(parts[1]);
                     string needle2 = parts.Length > 2 ? parts[2] : "";
+                    bool dlstop = parts.Length > 3 && parts[3] == "DLSTOP";   // 送货清单号命中即停
                     if (s_cancel) {
                         AppendOut("\r\n已暂停，扫描了 " + total + " 个 PDF，命中 " + hits + " 个。（可重新点执行继续新一轮）\r\n");
+                    } else if (dlstop) {
+                        AppendOut("\r\n送货清单号唯一：已命中并停止扫描（检查了 " + total + " 个 PDF，命中 " + hits + " 个，未逐个读完其余文件）。\r\n");
                     } else {
                         if (hits == 0) {
                             AppendOut("\r\n未找到文件名或正文包含编号 \"" + needle2 + "\" 的 PDF 文件。");
