@@ -189,7 +189,7 @@ namespace PdfFinder {
         }
 
         // ================= 自动更新（对标 update.c 机制）=================
-        public const string APP_VERSION = "2026.09.26.0017";   // 本地版本（YYYY.MM.DD.SEQ），唯一版本来源
+        public const string APP_VERSION = "2026.09.26.0018";   // 本地版本（YYYY.MM.DD.SEQ），唯一版本来源
         // 更新源（顺序即优先级）。
         // 【2026-09-23 现场实测定版】原方案照抄 MES 的 5 个(raw → fastly → gcore → testingcf → cdn)，
         // 但今天定位到一个 MES 那边没暴露的问题：**jsDelivr 对 @main 分支文件的缓存最长 12 小时**。
@@ -803,8 +803,22 @@ namespace PdfFinder {
                 });
                 bw.ReportProgress(0, "COUNT:" + list.Count);
                 int total = 0, hits = 0;
+                // 文件名预扫（0018）：把"名字就含编号"的文件全部立即报出，一个文件都不用读。
+                // 没有这一步，搜送货清单号（DL...）时结果要等主循环把排在 DL 档之前的
+                // 全部 report 文件读完正文才出现——功能能用但结果等到最后才出，等于难用。
+                var byName = new System.Collections.Generic.HashSet<string>();
+                foreach (var f in list) {
+                    if (s_cancel) break;
+                    total++;
+                    if (f.Name.IndexOf(needle, System.StringComparison.OrdinalIgnoreCase) >= 0) {
+                        hits++;
+                        byName.Add(f.FullName);
+                        bw.ReportProgress(0, "MATCH:" + FileLine(f));
+                    }
+                }
                 foreach (var f in list) {
                     if (s_cancel) break;   // 用户点了暂停
+                    if (byName.Contains(f.FullName)) continue;   // 文件名已命中并报过，不重复、不再读
                     total++;
                     try {
                         // 双路命中（潘工 2026-09-26）：文件名或正文包含编号都算。
