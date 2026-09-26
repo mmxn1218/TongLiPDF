@@ -104,7 +104,7 @@ namespace PdfFinder {
             // 简介
             var intro = new TextBox {
                 Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical,
-                Text = "【仓管员PDF查找器】\r\n\r\n使用步骤：\r\n1. 填写或浏览选择文件夹位置。\r\n2. 输入编号（如 W080300-104240）。\r\n3. 点击“执行”，下方实时列出所有正文含该编号的 PDF 路径。\r\n4. 双击结果中的某条路径，可直接打开该文件；若其所在文件夹当前没打开，会一并打开文件夹并选中该文件。\r\n（鼠标移到某个文件地址上，该行会变蓝，表示这里可以双击。）",
+                Text = "【仓管员PDF查找器】\r\n\r\n使用步骤：\r\n1. 填写或浏览选择文件夹位置。\r\n2. 输入编号（如 W080300-104240，或送货清单号 DL26092402497）。\r\n3. 点击“执行”，下方实时列出所有文件名或正文含该编号的 PDF 路径。\r\n4. 双击结果中的某条路径，可直接打开该文件；若其所在文件夹当前没打开，会一并打开文件夹并选中该文件。\r\n（鼠标移到某个文件地址上，该行会变蓝，表示这里可以双击。）",
                 Location = new System.Drawing.Point(12, 12), Size = new System.Drawing.Size(596, 120),
                 Font = new System.Drawing.Font("Microsoft YaHei", 10F)
             };
@@ -189,7 +189,7 @@ namespace PdfFinder {
         }
 
         // ================= 自动更新（对标 update.c 机制）=================
-        public const string APP_VERSION = "2026.09.23.0016";   // 本地版本（YYYY.MM.DD.SEQ），唯一版本来源
+        public const string APP_VERSION = "2026.09.26.0017";   // 本地版本（YYYY.MM.DD.SEQ），唯一版本来源
         // 更新源（顺序即优先级）。
         // 【2026-09-23 现场实测定版】原方案照抄 MES 的 5 个(raw → fastly → gcore → testingcf → cdn)，
         // 但今天定位到一个 MES 那边没暴露的问题：**jsDelivr 对 @main 分支文件的缓存最长 12 小时**。
@@ -807,9 +807,16 @@ namespace PdfFinder {
                     if (s_cancel) break;   // 用户点了暂停
                     total++;
                     try {
-                        byte[] data = System.IO.File.ReadAllBytes(f.FullName);
-                        string text = ExtractText(data);
-                        if (text != null && text.Contains(needle)) {
+                        // 双路命中（潘工 2026-09-26）：文件名或正文包含编号都算。
+                        // 送货清单（DL26092402497 这类）编号就在文件名里，且很多是扫描件、正文提取不出文字，
+                        // 所以文件名命中时不读文件直接算命中——又快又不怕正文抽不出来。
+                        bool hit = f.Name.IndexOf(needle, System.StringComparison.OrdinalIgnoreCase) >= 0;
+                        if (!hit) {
+                            byte[] data = System.IO.File.ReadAllBytes(f.FullName);
+                            string text = ExtractText(data);
+                            hit = (text != null && text.Contains(needle));
+                        }
+                        if (hit) {
                             hits++;
                             // 命中一个立即输出，不等全部扫完；附创建/修改时间便于辨认被改过或重命名的文件
                             bw.ReportProgress(0, "MATCH:" + FileLine(f));
@@ -838,7 +845,7 @@ namespace PdfFinder {
                         AppendOut("\r\n已暂停，扫描了 " + total + " 个 PDF，命中 " + hits + " 个。（可重新点执行继续新一轮）\r\n");
                     } else {
                         if (hits == 0) {
-                            AppendOut("\r\n未找到正文包含编号 \"" + needle2 + "\" 的 PDF 文件。");
+                            AppendOut("\r\n未找到文件名或正文包含编号 \"" + needle2 + "\" 的 PDF 文件。");
                         }
                         AppendOut("\r\n扫描完成，共 " + total + " 个 PDF，命中 " + hits + " 个。" + (hits == 0 ? "" : "（按最新优先，已实时列出）") + "\r\n");
                     }
